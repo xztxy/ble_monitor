@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
 # Usage:
-#   pip3 install bluepy
+#   pip3 install bleak asyncio
 #   python3 get_beacon_key.py <MAC> <PRODUCT_ID>
-# 
+#
 # List of PRODUCT_ID:
 #   339: For 'YLYK01YL'
 #   950: For 'YLKG07YL/YLKG08YL'
@@ -11,28 +11,33 @@
 #   1254: For 'YLYK01YL-VENFAN'
 #   1678: For 'YLYK01YL-FANCL'
 #
-# Example: 
+# Example:
 #   python3 get_beacon_key.py AB:CD:EF:12:34:56 950
 
-from bluepy.btle import UUID, Peripheral, DefaultDelegate
-
+import asyncio
 import random
 import re
 import sys
+
+from bleak import BleakClient
+from bleak.uuids import normalize_uuid_16
 
 MAC_PATTERN = r"^[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}:[0-9A-F]{2}$"
 
 UUID_SERVICE = "fe95"
 
-HANDLE_AUTH = 3
-HANDLE_FIRMWARE_VERSION = 10
-HANDLE_AUTH_INIT = 19
-HANDLE_BEACON_KEY= 25
+# The characteristics of the 'fe95' service have unique uuid values and thus can be addressed via their uuid
+# this can be checked by using the service explorer from https://github.com/hbldh/bleak/blob/master/examples/service_explorer.py
+HANDLE_AUTH = normalize_uuid_16(0x0001)
+HANDLE_FIRMWARE_VERSION = normalize_uuid_16(0x0004)
+HANDLE_AUTH_INIT = normalize_uuid_16(0x0010)
+HANDLE_BEACON_KEY = normalize_uuid_16(0x0014)
 
 MI_KEY1 = bytes([0x90, 0xCA, 0x85, 0xDE])
 MI_KEY2 = bytes([0x92, 0xAB, 0x54, 0xFA])
 SUBSCRIBE_TRUE = bytes([0x01, 0x00])
-  
+
+
 def reverseMac(mac) -> bytes:
     parts = mac.split(":")
     reversedMac = bytearray()
@@ -41,11 +46,14 @@ def reverseMac(mac) -> bytes:
         reversedMac.extend(bytearray.fromhex(parts[leng - i]))
     return reversedMac
 
+
 def mixA(mac, productID) -> bytes:
     return bytes([mac[0], mac[2], mac[5], (productID & 0xff), (productID & 0xff), mac[4], mac[5], mac[1]])
 
+
 def mixB(mac, productID) -> bytes:
     return bytes([mac[0], mac[2], mac[5], ((productID >> 8) & 0xff), mac[4], mac[0], mac[5], (productID & 0xff)])
+
 
 def cipherInit(key) -> bytes:
     perm = bytearray()
@@ -58,6 +66,7 @@ def cipherInit(key) -> bytes:
         j = j & 0xff
         perm[i], perm[j] = perm[j], perm[i]
     return perm
+
 
 def cipherCrypt(input, perm) -> bytes:
     index1 = 0
@@ -73,21 +82,23 @@ def cipherCrypt(input, perm) -> bytes:
         idx = idx & 0xff
         outputByte = input[i] ^ perm[idx]
         output.extend(bytes([outputByte & 0xff]))
-
     return output
+
 
 def cipher(key, input) -> bytes:
     # More information: https://github.com/drndos/mikettle
     perm = cipherInit(key)
     return cipherCrypt(input, perm)
 
+
 def generateRandomToken() -> bytes:
     token = bytearray()
     for i in range(0, 12):
-        token.extend(bytes([random.randint(0,255)]))
+        token.extend(bytes([random.randint(0, 255)]))
     return token
 
-def get_beacon_key(mac, product_id):
+
+async def get_beacon_key(mac, product_id):
     reversed_mac = reverseMac(mac)
     token = generateRandomToken()
 
@@ -96,30 +107,59 @@ def get_beacon_key(mac, product_id):
 
     # Connect
     print("Connection in progress...")
-    peripheral = Peripheral(deviceAddr=mac)
-    print("Successful connection!")
+    client = BleakClient(mac)
+    try:
+        await client.connect()
+        print("Successful connection!")
 
-    # Auth (More information: https://github.com/archaron/docs/blob/master/BLE/ylkg08y.md)
-    print("Authentication in progress...")
-    auth_service = peripheral.getServiceByUUID(UUID_SERVICE)
-    auth_descriptors = auth_service.getDescriptors()
-    peripheral.writeCharacteristic(HANDLE_AUTH_INIT, MI_KEY1, "true")
-    auth_descriptors[1].write(SUBSCRIBE_TRUE, "true")
-    peripheral.writeCharacteristic(HANDLE_AUTH, cipher(mixA(reversed_mac, product_id), token), "true")
-    peripheral.waitForNotifications(10.0)
-    peripheral.writeCharacteristic(3, cipher(token, MI_KEY2), "true")
-    print("Successful authentication!")
-    
-    # Read
-    beacon_key = cipher(token, peripheral.readCharacteristic(HANDLE_BEACON_KEY)).hex()
-    firmware_version = cipher(token, peripheral.readCharacteristic(HANDLE_FIRMWARE_VERSION)).decode()
+        # An asyncio future object is needed for callback handling
+        future = asyncio.get_event_loop().create_future()
 
-    print(f"beaconKey: '{beacon_key}'")
-    print(f"firmware_version: '{firmware_version}'")
+        # Auth (More information: https://github.com/archaron/docs/blob/master/BLE/ylkg08y.md)
+        print("Authentication in progress...")
 
-def main(argv):
+        # Send 0x90, 0xCA, 0x85, 0xDE bytes to authInitCharacteristic.
+        await client.write_gatt_char(HANDLE_AUTH_INIT, MI_KEY1, True)
+        # Subscribe authCharacteristic.
+        # (a lambda callback is used to set the futures result on the notification event)
+        await client.start_notify(HANDLE_AUTH, lambda _, data: future.set_result(data))
+        # Send cipher(mixA(reversedMac, productID), token) to authCharacteristic.
+        await client.write_gatt_char(HANDLE_AUTH, cipher(mixA(reversed_mac, product_id), token), True)
+        # Now you'll get a notification on authCharacteristic. You must wait for this notification before proceeding to next step
+        await asyncio.wait_for(future, 10.0)
+
+        # The notification data can be ignored or used to check an integrity, this is optional
+        print(f"notifyData:  '{future.result().hex()}'")
+        # If you want to perform a check, compare cipher(mixB(reversedMac, productID), cipher(mixA(reversedMac, productID), res))
+        # where res is received payload ...
+        print(f"cipheredRes: '{cipher(mixB(reversed_mac, product_id), cipher(mixA(reversed_mac, product_id), future.result())).hex()}'")
+        # ... with your token, they must equal.
+        print(f"randomToken: '{token.hex()}'")
+
+        # Send 0x92, 0xAB, 0x54, 0xFA to authCharacteristic.
+        await client.write_gatt_char(HANDLE_AUTH, cipher(token, MI_KEY2), True)
+        print("Successful authentication!")
+
+        # Read
+        beacon_key = cipher(token, await client.read_gatt_char(HANDLE_BEACON_KEY)).hex()
+        # Read from verCharacteristics. You can ignore the response data, you just have to perform a read to complete authentication process.
+        # If the data is used, it will show the firmware version
+        firmware_version = cipher(token, await client.read_gatt_char(HANDLE_FIRMWARE_VERSION)).decode()
+
+        print(f"beaconKey: '{beacon_key}'")
+        print(f"firmware_version: '{firmware_version}'")
+
+        print("Disconnection in progress...")
+    except Exception as e:
+        print(e)
+    finally:
+        await client.disconnect()
+        print("Disconnected!")
+
+
+async def main(argv):
     # ARGS
-    if len(argv) <= 2 : 
+    if len(argv) <= 2:
         print("usage: get_beacon_key.py <MAC> <PRODUCT_ID>\n")
         print("PRODUCT_ID:")
         print("  339: For 'YLYK01YL'")
@@ -135,7 +175,7 @@ def main(argv):
         print(f"[ERROR] The MAC address '{mac}' seems to be in the wrong format")
         return
 
-    # PRODUCT_ID  
+    # PRODUCT_ID
     product_id = argv[2]
     try:
         product_id = int(product_id)
@@ -144,7 +184,8 @@ def main(argv):
         return
 
     # BEACON_KEY
-    get_beacon_key(mac, product_id)
+    await get_beacon_key(mac, product_id)
+
 
 if __name__ == '__main__':
-    main(sys.argv)
+    asyncio.run(main(sys.argv))

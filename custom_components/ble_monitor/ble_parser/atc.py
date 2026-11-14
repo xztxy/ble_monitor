@@ -1,13 +1,16 @@
-# Parser for ATC BLE advertisements
-from Cryptodome.Cipher import AES
+"""Parser for ATC BLE advertisements"""
 import logging
 from struct import unpack
+
+from Cryptodome.Cipher import AES
+
+from .helpers import to_mac, to_unformatted_mac
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def parse_atc(self, data, source_mac, rssi):
-    # check for adstruc length
+def parse_atc(self, data: bytes, mac: bytes):
+    """Parse ATC BLE advertisements"""
     device_type = "ATC"
     msg_length = len(data)
     if msg_length == 19:
@@ -22,7 +25,8 @@ def parse_atc(self, data, source_mac, rssi):
             "voltage": volt / 1000,
             "battery": batt,
             "switch": (trg >> 1) & 1,
-            "opening": (trg ^ 1) & 1,
+            "opening": (~trg ^ 1) & 1,
+            "status": "opened",
             "data": True
         }
         adv_priority = 39
@@ -41,7 +45,7 @@ def parse_atc(self, data, source_mac, rssi):
         adv_priority = 29
     elif msg_length == 15:
         # Parse BLE message in Custom format with encryption
-        atc_mac = source_mac
+        atc_mac = mac
         packet_id = data[4]
         firmware = "ATC (Custom encrypted)"
         decrypted_data = decrypt_atc(self, data, atc_mac)
@@ -59,13 +63,14 @@ def parse_atc(self, data, source_mac, rssi):
                 "voltage": volt,
                 "battery": batt,
                 "switch": (trg >> 1) & 1,
-                "opening": (trg ^ 1) & 1,
+                "opening": (~trg ^ 1) & 1,
+                "status": "opened",
                 "data": True
             }
             adv_priority = 39
     elif msg_length == 12:
         # Parse BLE message in Atc1441 format with encryption
-        atc_mac = source_mac
+        atc_mac = mac
         packet_id = data[4]
         firmware = "ATC (Atc1441 encrypted)"
         decrypted_data = decrypt_atc(self, data, atc_mac)
@@ -92,15 +97,10 @@ def parse_atc(self, data, source_mac, rssi):
     else:
         if self.report_unknown == "ATC":
             _LOGGER.info(
-                "BLE ADV from UNKNOWN ATC DEVICE: RSSI: %s, MAC: %s, AdStruct: %s",
-                rssi,
-                to_mac(source_mac),
+                "BLE ADV from UNKNOWN ATC DEVICE: MAC: %s, AdStruct: %s",
+                to_mac(mac),
                 data.hex()
             )
-        return None
-
-    # check for MAC presence in whitelist, if needed
-    if self.discovery is False and atc_mac.lower() not in self.whitelist:
         return None
 
     try:
@@ -117,11 +117,10 @@ def parse_atc(self, data, source_mac, rssi):
         # always process advertisements with a higher priority
         self.adv_priority[atc_mac] = adv_priority
     elif adv_priority == old_adv_priority:
-        # only process messages with same priority that have a unique packet id
-        if prev_packet == packet_id:
-            return None
-        else:
-            pass
+        if self.filter_duplicates is True:
+            # only process messages with same priority that have a changed packet id
+            if prev_packet == packet_id:
+                return None
     else:
         # do not process advertisements with lower priority
         old_adv_priority -= 1
@@ -130,8 +129,7 @@ def parse_atc(self, data, source_mac, rssi):
     self.lpacket_ids[atc_mac] = packet_id
 
     result.update({
-        "rssi": rssi,
-        "mac": ''.join('{:02X}'.format(x) for x in atc_mac),
+        "mac": to_unformatted_mac(atc_mac),
         "type": device_type,
         "packet": packet_id,
         "firmware": firmware
@@ -141,11 +139,12 @@ def parse_atc(self, data, source_mac, rssi):
 
 
 def decrypt_atc(self, data, atc_mac):
-    # try to find encryption key for current device
+    """Try to find encryption key for current device"""
     try:
         key = self.aeskeys[atc_mac]
         if len(key) != 16:
             _LOGGER.error("Encryption key should be 16 bytes (32 characters) long")
+            return None
     except KeyError:
         # no encryption key found
         _LOGGER.error("No encryption key found for ATC device with MAC: %s", to_mac(atc_mac))
@@ -174,7 +173,3 @@ def decrypt_atc(self, data, atc_mac):
         return None
 
     return decrypted_payload
-
-
-def to_mac(addr: int):
-    return ':'.join('{:02x}'.format(x) for x in addr).upper()

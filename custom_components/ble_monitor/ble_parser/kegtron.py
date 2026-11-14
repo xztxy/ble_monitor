@@ -1,6 +1,8 @@
-# Parser for Kegtron BLE advertisements
+"""Parser for Kegtron BLE advertisements"""
 import logging
 from struct import unpack
+
+from .helpers import to_mac, to_unformatted_mac
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -19,12 +21,11 @@ KEGTRON_SIZE_DICT = {
 }
 
 
-def parse_kegtron(self, data, source_mac, rssi):
-    # check for adstruc length
+def parse_kegtron(self, data: bytes, mac: bytes):
+    """Parser for Kegtron sensors"""
     msg_length = len(data)
     if msg_length == 31:
         firmware = "Kegtron"
-        kegtron_mac = source_mac
         (device_id,) = unpack(">B", data[10:11])
         if device_id & (1 << 6):
             device_type = "Kegtron KT-200"
@@ -55,7 +56,7 @@ def parse_kegtron(self, data, source_mac, rssi):
         else:
             port_count = "Single port device"
 
-        port_name = str(port_name.decode("utf-8").rstrip('\x00'))
+        port_name = str(port_name.decode("utf-8", errors="replace").rstrip('\x00'))
 
         result = {
             "keg size": keg_size,
@@ -73,17 +74,11 @@ def parse_kegtron(self, data, source_mac, rssi):
         else:
             return None
 
-        # check for MAC presence in whitelist, if needed
-        if self.discovery is False and kegtron_mac.lower() not in self.whitelist:
-            _LOGGER.debug("Discovery is disabled. MAC: %s is not whitelisted!", to_mac(kegtron_mac))
-            return None
-
         result.update({
             "type": device_type,
             "firmware": firmware,
-            "mac": ''.join('{:02X}'.format(x) for x in kegtron_mac),
+            "mac": to_unformatted_mac(mac),
             "packet": "no packet id",
-            "rssi": rssi,
             "data": True,
         })
         return result
@@ -91,11 +86,7 @@ def parse_kegtron(self, data, source_mac, rssi):
         if self.report_unknown == "Kegtron":
             _LOGGER.debug(
                 "UNKNOWN dataobject from Kegtron DEVICE: MAC: %s, ADV: %s",
-                to_mac(source_mac),
+                to_mac(mac),
                 data.hex()
             )
         return None
-
-
-def to_mac(addr: int):
-    return ':'.join('{:02x}'.format(x) for x in addr).upper()

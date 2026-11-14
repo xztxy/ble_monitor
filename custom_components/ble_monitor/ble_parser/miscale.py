@@ -1,28 +1,30 @@
-# Parser for Xiaomi Mi Scale BLE advertisements
+"""Parser for Xiaomi Mi Scale BLE advertisements"""
 import logging
 from struct import unpack
+
+from .helpers import to_mac, to_unformatted_mac
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def parse_miscale(self, data, source_mac, rssi):
-    # check for adstruc length
+def parse_miscale(self, data: bytes, mac: bytes):
+    """Parser for Xiaomi Mi Scales."""
     msg_length = len(data)
     uuid16 = (data[3] << 8) | data[2]
 
     if msg_length == 14 and uuid16 == 0x181D:  # Mi Scale V1
         device_type = "Mi Scale V1"
         xvalue = data[4:]
-        (controlByte, weight) = unpack("<BH7x", xvalue)
+        (control_byte, weight) = unpack("<BH7x", xvalue)
 
-        hasImpedance = False
-        isStabilized = controlByte & (1 << 5)
-        weightRemoved = controlByte & (1 << 7)
+        has_impedance = False
+        is_stabilized = control_byte & (1 << 5)
+        weight_removed = control_byte & (1 << 7)
 
-        if controlByte & (1 << 0):
+        if control_byte & (1 << 0):
             weight = weight / 100
             weight_unit = 'lbs'
-        elif controlByte & (1 << 4):
+        elif control_byte & (1 << 4):
             weight = weight / 100
             weight_unit = 'jin'
         else:
@@ -32,20 +34,20 @@ def parse_miscale(self, data, source_mac, rssi):
     elif msg_length == 17 and uuid16 == 0x181B:  # Mi Scale V2
         device_type = "Mi Scale V2"
         xvalue = data[4:]
-        (measunit, controlByte, impedance, weight) = unpack("<BB7xHH", xvalue)
-        hasImpedance = controlByte & (1 << 1)
-        isStabilized = controlByte & (1 << 5)
-        weightRemoved = controlByte & (1 << 7)
+        (control_byte_1, control_byte_2, impedance, weight) = unpack("<BB7xHH", xvalue)
+        has_impedance = control_byte_2 & (1 << 1)
+        is_stabilized = control_byte_2 & (1 << 5)
+        weight_removed = control_byte_2 & (1 << 7)
 
-        if measunit & (1 << 4):
+        if control_byte_2 & (1 << 6):
             # measurement in Chinese Catty unit
             weight = weight / 100
             weight_unit = "jin"
-        elif measunit == 3:
+        elif control_byte_1 == 3:
             # measurement in lbs
             weight = weight / 100
             weight_unit = "lbs"
-        elif measunit == 2:
+        elif control_byte_1 == 2:
             # measurement in kg
             weight = weight / 200
             weight_unit = "kg"
@@ -55,11 +57,12 @@ def parse_miscale(self, data, source_mac, rssi):
             weight_unit = None
     else:
         device_type = None
+
     if device_type is None:
         if self.report_unknown == "Mi Scale":
             _LOGGER.info(
                 "BLE ADV from UNKNOWN Mi Scale DEVICE: MAC: %s, ADV: %s",
-                to_mac(source_mac),
+                to_mac(mac),
                 data.hex()
             )
         return None
@@ -67,49 +70,50 @@ def parse_miscale(self, data, source_mac, rssi):
     result = {
         "non-stabilized weight": weight,
         "weight unit": weight_unit,
-        "weight removed": 0 if weightRemoved == 0 else 1,
-        "stabilized": 0 if isStabilized == 0 else 1
+        "weight removed": 0 if weight_removed == 0 else 1,
+        "stabilized": 0 if is_stabilized == 0 else 1
     }
 
-    if isStabilized and not weightRemoved:
-        result.update({"weight": weight})
-
-    if hasImpedance:
-        result.update({"impedance": impedance})
+    if device_type == "Mi Scale V1":
+        if is_stabilized and not weight_removed:
+            result.update({"weight": weight})
+    elif device_type == "Mi Scale V2":
+        if is_stabilized and (weight_removed == 0):
+            result.update({"stabilized weight": weight})
+            if has_impedance:
+                result.update({"weight": weight})
+                result.update({"impedance": impedance})
+    else:
+        pass
 
     firmware = device_type
-    miscale_mac = source_mac
 
     # Check for duplicate messages
     packet_id = xvalue.hex()
     try:
-        prev_packet = self.lpacket_ids[miscale_mac]
+        prev_packet = self.lpacket_ids[mac]
     except KeyError:
         # start with empty first packet
         prev_packet = None
     if prev_packet == packet_id:
         # only process new messages
-        return None
-    self.lpacket_ids[miscale_mac] = packet_id
-    if prev_packet is None:
-        # ignore first message after a restart
-        return None
-
-    # check for MAC presence in whitelist, if needed
-    if self.discovery is False and miscale_mac.lower() not in self.whitelist:
-        _LOGGER.debug("Discovery is disabled. MAC: %s is not whitelisted!", to_mac(miscale_mac))
+        if self.filter_duplicates is True:
+            return None
+    self.lpacket_ids[mac] = packet_id
+    if (
+        prev_packet is None
+        and self.filter_duplicates is True
+        and is_stabilized
+        and weight_removed
+    ):
+        # Ignore a stale, removed measurement when the scale wakes after a restart
         return None
 
     result.update({
         "type": device_type,
         "firmware": firmware,
-        "mac": ''.join('{:02X}'.format(x) for x in miscale_mac),
+        "mac": to_unformatted_mac(mac),
         "packet": packet_id,
-        "rssi": rssi,
         "data": True,
     })
     return result
-
-
-def to_mac(addr: int):
-    return ':'.join('{:02x}'.format(x) for x in addr).upper()
